@@ -14,6 +14,11 @@ Contract implemented here:
   Pages from the discarded attempt are never mixed into the published result.
 * Publication and watermark advance happen in a single SQLite transaction (see
   :meth:`Store.commit_run`).  Any failure leaves published data untouched.
+* Every fetched page's original bytes are written to the raw-page volume
+  (fsync + atomic rename, in a worker thread so a slow disk never blocks
+  queries or cancellation) before its records are staged.  The commit then
+  publishes catalogue, provenance and watermark together; pages of failed,
+  cancelled or abandoned attempts are recycled by the sweeper.
 * Cancellation is enforced between pages, while parsing, and again inside the
   commit transaction.  The API cancels the asyncio task so a slow page is not
   waited for; the task's late response can neither publish nor touch another
@@ -110,6 +115,7 @@ class Harvester:
         self.config = config
         self._client_factory = client_factory or self._default_client
         self._controls: dict[str, RunControl] = {}
+        self._sweep_tasks: set[asyncio.Task] = set()
         self._lock = asyncio.Lock()
 
     def _default_client(self) -> OaiClient:
@@ -197,6 +203,34 @@ class Harvester:
                     await control.task
                 except (asyncio.CancelledError, Exception):
                     pass
+        if self._sweep_tasks:
+            await asyncio.gather(*list(self._sweep_tasks), return_exceptions=True)
+        try:
+            await asyncio.to_thread(self.store.collect_garbage)
+        except Exception:
+            pass
+
+    def _schedule_sweep(self) -> None:
+        """Recycle a finished round's raw pages off the event loop.
+
+        File deletion can be slow; it runs in a worker thread and only ever
+        removes files of terminal rounds or abandoned attempts — never a
+        running round's files and never published history.
+        """
+        try:
+            task = asyncio.ensure_future(
+                asyncio.to_thread(self.store.collect_garbage)
+            )
+        except RuntimeError:
+            return  # no running loop (interpreter shutdown)
+        self._sweep_tasks.add(task)
+
+        def _done(done_task: asyncio.Task) -> None:
+            self._sweep_tasks.discard(done_task)
+            if not done_task.cancelled():
+                done_task.exception()  # retrieve to avoid warnings
+
+        task.add_done_callback(_done)
 
     def _check_cancelled(self, control: RunControl) -> None:
         if control.cancel_requested or not self.store.is_run_running(control.run_id):
@@ -225,6 +259,10 @@ class Harvester:
             self.store.finish_failed(run_id, f"采集异常: {exc!r}")
             control.resolve("failed")
         finally:
+            # Recycle this round's raw pages (failed/cancelled rounds,
+            # abandoned attempts of a succeeded round) without blocking
+            # the loop; published pages are never touched.
+            self._schedule_sweep()
             async with self._lock:
                 if len(self._controls) > 50:
                     for key, value in list(self._controls.items()):
@@ -456,7 +494,27 @@ class Harvester:
                 )
 
             seq += 1
-            if not store.stage_records(run_id, page_records, seq * 1_000_000):
+            # Persist the page's original bytes first (fsync + atomic
+            # rename, in a worker thread so a slow disk does not block
+            # queries or cancellation).  Only after the bytes are durable
+            # does the staging transaction index them; a crash in between
+            # leaves an orphan file the sweeper recycles.
+            page_meta: dict[str, Any] | None = None
+            if page.raw is not None:
+                page_meta = await asyncio.to_thread(
+                    store.write_page_file,
+                    run_id,
+                    attempt,
+                    seq,
+                    page.raw,
+                    response_date=page.response_date,
+                    complete_list_size=page.complete_list_size,
+                    record_count=len(page.records),
+                )
+            staged = store.stage_records(
+                run_id, page_records, seq * 1_000_000, page=page_meta
+            )
+            if staged is None:
                 raise HarvestCancelled(control.cancel_reason or "本轮已取消")
 
             stats.records += len(page_records)

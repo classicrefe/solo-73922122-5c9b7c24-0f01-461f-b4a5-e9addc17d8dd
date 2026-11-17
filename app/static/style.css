@@ -81,6 +81,7 @@ button.primary { background: var(--accent); color: #fff; border-color: var(--acc
 button.danger { background: #fff; color: var(--danger); border-color: #e3b3ad; }
 button:disabled { opacity: .55; cursor: not-allowed; }
 .actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+.actions .button-link { text-decoration: none; }
 .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
 
 .progress {

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>原文页 · {{ page.run_id[:8] }} · 尝试 {{ page.attempt }} · 第 {{ page.page_no }} 页</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>原文页</h1>
+    <p class="sub">成功轮次最终采用页的原字节 · 轮次 <code>{{ page.run_id[:8] }}</code> · 尝试 {{ page.attempt }} · 第 {{ page.page_no }} 页</p>
+  </div>
+  <nav>
+    <a href="/">目录</a>
+    <a href="/runs">轮次记录</a>
+    <a href="/provenance">采集溯源</a>
+    <a href="/status">状态 JSON</a>
+  </nav>
+</header>
+
+<main class="layout">
+  <section class="panel grow">
+    <h2>页信息</h2>
+    <div class="meta-grid">
+      <div><span class="label">轮次</span><strong class="mono">{{ page.run_id }}</strong></div>
+      <div><span class="label">轮次开始</span><strong class="mono">{{ page.run_started_at }}</strong></div>
+      <div><span class="label">时间窗（闭区间）</span><strong class="mono">{{ page.window_from or "（全量）" }} → {{ page.window_until }}</strong></div>
+      <div><span class="label">尝试 / 页号</span><strong>第 {{ page.attempt }} 次尝试 · 第 {{ page.page_no }} 页</strong></div>
+      <div><span class="label">源端 responseDate</span><strong class="mono">{{ page.response_date or "—" }}</strong></div>
+      <div><span class="label">completeListSize</span><strong>{{ page.complete_list_size if page.complete_list_size is not none else "—" }}</strong></div>
+      <div><span class="label">记录数</span><strong>{{ page.record_count }}</strong></div>
+      <div><span class="label">字节数</span><strong>{{ page.byte_size }}</strong></div>
+    </div>
+    <div class="meta-grid">
+      <div style="grid-column: 1 / -1">
+        <span class="label">SHA-256（{% if sha_match %}校验一致{% else %}与存档不一致！{% endif %}）</span>
+        <strong class="mono" style="word-break: break-all">{{ page.sha256 }}</strong>
+      </div>
+    </div>
+    <div class="actions">
+      <a class="button-link" href="/provenance/pages/{{ page.run_id }}/{{ page.attempt }}/{{ page.page_no }}/download"><button class="primary" type="button">下载 XML 原字节（{{ download_name }}）</button></a>
+      <a class="button-link" href="/provenance/pages/{{ page.run_id }}/{{ page.attempt }}/{{ page.page_no }}/sha256"><button type="button">下载 .sha256</button></a>
+    </div>
+
+    <h3>页内记录（位置 = 在源响应中的出现顺序）</h3>
+    {% if parse_error %}
+      <p class="flash">存档页解析失败：{{ parse_error }}（原字节仍在下方展示）</p>
+    {% endif %}
+    {% if records %}
+    <table class="records">
+      <thead>
+        <tr><th>页内位置</th><th>标识</th><th>datestamp</th><th>状态</th><th>本轮是否最终采用</th><th></th></tr>
+      </thead>
+      <tbody>
+      {% for r in records %}
+        <tr>
+          <td>{{ r.position }}</td>
+          <td class="mono small">{{ r.identifier }}</td>
+          <td class="mono small">{{ r.datestamp }}</td>
+          <td>{% if r.deleted %}<span class="badge failed">deleted</span>{% else %}<span class="badge">live</span>{% endif %}</td>
+          <td>
+            {% if r.adopted %}
+              {% if r.adopted_deleted %}<span class="badge failed">采用（撤回）</span>{% else %}<span class="badge succeeded">采用</span>{% endif %}
+            {% else %}
+              <span class="muted">未采用（同标识被本页或后续页的更新记录取代）</span>
+            {% endif %}
+          </td>
+          <td class="small"><a href="/provenance?identifier={{ r.identifier | urlencode }}">溯源</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>XML 原字节</h2>
+    <pre class="mono">{{ xml }}</pre>
+  </section>
+</main>
+</body>
+</html>

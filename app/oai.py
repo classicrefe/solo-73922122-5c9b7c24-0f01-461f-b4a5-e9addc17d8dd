@@ -57,6 +57,10 @@ class OaiPage:
     complete_list_size: int | None = None
     cursor: int | None = None
     response_date: str | None = None
+    # The exact response bytes this page was parsed from.  Kept so the
+    # harvester can archive the source response for provenance.  ``None``
+    # for synthetic pages (unit tests), in which case no raw page is stored.
+    raw: bytes | None = field(default=None, repr=False, compare=False)
 
 
 def normalize_datestamp(value: str | None, what: str = "datestamp") -> str:
@@ -203,6 +207,7 @@ def parse_list_records(content: bytes) -> OaiPage:
         complete_list_size=complete_list_size,
         cursor=cursor,
         response_date=response_date,
+        raw=content,
     )
 
 

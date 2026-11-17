@@ -36,6 +36,20 @@ PAGE_SIZE = int(os.environ.get("DEMO_PAGE_SIZE", "3"))
 repo = DemoRepo(DB_PATH, page_size=PAGE_SIZE)
 
 
+def _form_text(value: str) -> str:
+    """Repair form text misdecoded as latin-1.
+
+    Starlette decodes urlencoded form fields as latin-1, while browsers
+    submit UTF-8 percent-encoded bytes; non-ASCII titles/identifiers would
+    otherwise be stored as mojibake.  ASCII and already-correct text pass
+    through unchanged.
+    """
+    try:
+        return value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -98,12 +112,13 @@ async def add(
     creator: str = Form(""),
     identifier: str = Form(""),
 ) -> RedirectResponse:
+    title = _form_text(title)
     if not title.strip():
         return _back("标题不能为空")
     repo.add_record(
         title=title.strip(),
-        creator=creator.strip() or None,
-        identifier=identifier.strip() or None,
+        creator=_form_text(creator).strip() or None,
+        identifier=_form_text(identifier).strip() or None,
     )
     return _back("已新增记录（源端 datestamp 为当前秒）")
 
@@ -111,7 +126,10 @@ async def add(
 @app.post("/demo/correct")
 async def correct(identifier: str = Form(...), title: str = Form(...)) -> RedirectResponse:
     try:
-        repo.touch_record(identifier.strip(), title=title.strip() or None)
+        repo.touch_record(
+            _form_text(identifier).strip(),
+            title=_form_text(title).strip() or None,
+        )
     except KeyError:
         return _back(f"记录 {identifier} 不存在")
     return _back("已更正记录（datestamp 更新为当前秒）")
@@ -120,7 +138,7 @@ async def correct(identifier: str = Form(...), title: str = Form(...)) -> Redire
 @app.post("/demo/withdraw")
 async def withdraw(identifier: str = Form(...)) -> RedirectResponse:
     try:
-        repo.withdraw(identifier.strip())
+        repo.withdraw(_form_text(identifier).strip())
     except KeyError:
         return _back(f"记录 {identifier} 不存在")
     return _back("已撤回（header status=deleted）")
@@ -129,7 +147,7 @@ async def withdraw(identifier: str = Form(...)) -> RedirectResponse:
 @app.post("/demo/restore")
 async def restore(identifier: str = Form(...)) -> RedirectResponse:
     try:
-        repo.restore(identifier.strip())
+        repo.restore(_form_text(identifier).strip())
     except KeyError:
         return _back(f"记录 {identifier} 不存在")
     return _back("已恢复记录")

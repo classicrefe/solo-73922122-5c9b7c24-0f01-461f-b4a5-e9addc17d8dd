@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>采集溯源</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>采集溯源</h1>
+    <p class="sub">按标识查看启用溯源后各成功轮次最终采用的记录 · 定位轮次 / 尝试 / 页号 / 页内位置 · 查看与下载该页 XML 原字节及 SHA-256</p>
+  </div>
+  <nav>
+    <a href="/">目录</a>
+    <a href="/runs">轮次记录</a>
+    <a href="/provenance">采集溯源</a>
+    <a href="/status">状态 JSON</a>
+  </nav>
+</header>
+
+<main class="layout">
+  <section class="panel grow">
+    <div class="panel-head">
+      <h2>按标识查询</h2>
+      <form class="search" method="get" action="/provenance">
+        <input type="search" name="identifier" value="{{ query }}" placeholder="OAI 标识，如 oai:demo:0001">
+        <button type="submit">查询</button>
+      </form>
+    </div>
+
+    {% if query %}
+      {% if result.entries %}
+        <p class="small muted">
+          标识 <code>{{ query }}</code> 在启用溯源后共被 {{ result.entries | length }} 个成功轮次采用过；
+          当前{% if result.in_catalog %}在已发布目录中（{{ result.catalog.title }}）{% else %}不在已发布目录（可能已撤回）{% endif %}。
+        </p>
+        <table class="records">
+          <thead>
+            <tr>
+              <th>轮次 / 发布时间</th><th>时间窗（闭区间）</th><th>尝试</th>
+              <th>页号</th><th>页内位置</th><th>源端 datestamp</th>
+              <th>采用结果</th><th>采用时标题</th><th>原文</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for e in result.entries %}
+            <tr>
+              <td class="mono small">
+                {{ e.run_id[:8] }}<br>
+                <span class="muted">{{ e.run_started_at }}</span>
+              </td>
+              <td class="mono small">{{ e.window_from or "（全量）" }} → {{ e.window_until }}</td>
+              <td>{{ e.attempt }}</td>
+              <td>{{ e.page_no }}</td>
+              <td>{{ e.position }}</td>
+              <td class="mono small">{{ e.datestamp }}</td>
+              <td>
+                {% if e.deleted %}<span class="badge failed">撤回</span>
+                {% else %}<span class="badge succeeded">采用</span>{% endif %}
+              </td>
+              <td class="small">{{ e.title or "—" }}</td>
+              <td class="small">
+                {% if e.sha256 %}
+                  <a href="/provenance/pages/{{ e.run_id }}/{{ e.attempt }}/{{ e.page_no }}">查看</a> ·
+                  <a href="/provenance/pages/{{ e.run_id }}/{{ e.attempt }}/{{ e.page_no }}/download">下载</a><br>
+                  <span class="mono muted" title="SHA-256: {{ e.sha256 }}">sha256: {{ e.sha256[:16] }}…</span>
+                {% else %}
+                  <span class="muted">无原文</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        {% if result.in_catalog %}
+          <p class="empty">标识 <code>{{ query }}</code> 在已发布目录中（{{ result.catalog.title }}），
+          但属于<strong>启用溯源前采集的旧目录，无原文留存</strong>。</p>
+        {% else %}
+          <p class="empty">没有找到标识 <code>{{ query }}</code> 的溯源记录：启用溯源后的成功轮次从未采用过它。</p>
+        {% endif %}
+      {% endif %}
+    {% else %}
+      <p class="hint">输入标识可查看它在启用溯源后各成功轮次最终采用的记录，并定位到具体轮次、尝试、页号与页内位置，查看或下载该页 XML 原字节及 SHA-256。启用溯源前采集的旧目录会标明“无原文”。</p>
+    {% endif %}
+  </section>
+
+  <aside class="panel">
+    <h2>原文存档</h2>
+    <div class="meta-grid">
+      <div><span class="label">已发布原文页</span><strong>{{ raw.published_pages }} 页</strong></div>
+      <div><span class="label">已发布原文字节</span><strong>{{ raw.published_bytes }} 字节</strong></div>
+      <div><span class="label">溯源条目</span><strong>{{ raw.provenance_entries }} 条</strong></div>
+    </div>
+
+    <h3>最近撤回（撤回历史）</h3>
+    {% if withdrawals %}
+    <table class="records">
+      <thead><tr><th>标识</th><th>撤回 datestamp</th><th>发布于轮次</th><th></th></tr></thead>
+      <tbody>
+      {% for w in withdrawals %}
+        <tr>
+          <td class="mono small">{{ w.identifier }}</td>
+          <td class="mono small">{{ w.datestamp }}</td>
+          <td class="mono small">{{ w.run_id[:8] }}<br><span class="muted">{{ w.published_at }}</span></td>
+          <td class="small"><a href="/provenance?identifier={{ w.identifier | urlencode }}">溯源</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="muted">启用溯源后还没有撤回记录被发布过。</p>
+    {% endif %}
+  </aside>
+</main>
+</body>
+</html>

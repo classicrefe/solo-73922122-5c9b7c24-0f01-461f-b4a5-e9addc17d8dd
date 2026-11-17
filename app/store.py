@@ -5,6 +5,18 @@ database.  A harvest round writes into ``run_records`` (a per-run staging
 area) and only the final commit transaction copies staging into ``catalog``
 and advances the watermark.  This is what makes a failed or interrupted
 round a no-op for readers of the published catalogue.
+
+Provenance (溯源): the original bytes of every fetched page are stored as
+files on the persistent volume (see :class:`app.rawstore.RawStore`); SQLite
+only keeps the index — ``run_pages`` (one row per fetched page: file path,
+SHA-256, size, state) and ``provenance`` (which record each successful
+round finally adopted for an identifier, and where to find it: round,
+attempt, page, position within the page).  Catalogue, provenance and
+watermark are published in the *same* commit transaction, after all raw
+pages of the round are durably on disk, so a crash can only ever expose a
+complete old or complete new version.  Pages of failed, cancelled or
+abandoned attempts are recycled by :meth:`Store.collect_garbage`, which
+never touches published history.
 """
 
 from __future__ import annotations
@@ -16,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .rawstore import RawStore
+
 
 def utc_now_millis() -> str:
     return (
@@ -26,10 +40,14 @@ def utc_now_millis() -> str:
 
 
 class Store:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self, db_path: str | Path, *, raw_dir: str | Path | None = None
+    ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._raw = RawStore(raw_dir or (self.db_path.parent / "raw"))
         self._lock = threading.RLock()
+        self._sweep_lock = threading.Lock()
         self._conn = sqlite3.connect(
             str(self.db_path), check_same_thread=False, isolation_level=None
         )
@@ -41,6 +59,10 @@ class Store:
         self._init_schema()
         self._recover_interrupted_runs()
         self._ensure_invariants()
+        # Continue any cleanup a previous process did not finish (crashed
+        # mid-sweep, late writes from a killed round, ...).  Published
+        # history is never touched.
+        self.collect_garbage()
 
     # ------------------------------------------------------------------ schema
     def _init_schema(self) -> None:
@@ -88,9 +110,52 @@ class Store:
                     datestamp TEXT NOT NULL,
                     deleted INTEGER NOT NULL DEFAULT 0,
                     seq INTEGER NOT NULL,
+                    attempt INTEGER,
+                    page_no INTEGER,
+                    position INTEGER,
                     PRIMARY KEY (run_id, identifier),
                     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS run_pages (
+                    run_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    page_no INTEGER NOT NULL,
+                    file_path TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    record_count INTEGER NOT NULL DEFAULT 0,
+                    response_date TEXT,
+                    complete_list_size INTEGER,
+                    state TEXT NOT NULL DEFAULT 'staged' CHECK (
+                        state IN ('staged', 'published', 'abandoned')
+                    ),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, attempt, page_no),
+                    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS provenance (
+                    identifier TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    page_no INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    datestamp TEXT NOT NULL,
+                    deleted INTEGER NOT NULL DEFAULT 0,
+                    title TEXT,
+                    creator TEXT,
+                    window_from TEXT,
+                    window_until TEXT,
+                    published_at TEXT NOT NULL,
+                    PRIMARY KEY (identifier, run_id),
+                    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_provenance_published
+                    ON provenance(published_at);
+                CREATE INDEX IF NOT EXISTS idx_provenance_deleted
+                    ON provenance(deleted, published_at);
 
                 CREATE TABLE IF NOT EXISTS catalog (
                     identifier TEXT PRIMARY KEY,
@@ -107,6 +172,19 @@ class Store:
                 VALUES (1, NULL, NULL, 0, NULL);
                 """
             )
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Add provenance columns to a pre-existing ``run_records`` table."""
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(run_records)")
+        }
+        for name in ("attempt", "page_no", "position"):
+            if name not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE run_records ADD COLUMN {name} INTEGER"
+                )
 
     def _recover_interrupted_runs(self) -> None:
         """A previous process died.  No in-memory task can own these runs."""
@@ -376,44 +454,125 @@ class Store:
                 raise
 
     def reset_stage(self, run_id: str) -> bool:
-        """Discard all pages collected for the current attempt."""
+        """Discard all pages collected for the current attempt.
+
+        The staged records are deleted and the attempt's raw pages are
+        marked ``abandoned``; the sweeper recycles their files.  Nothing
+        from the abandoned attempt can leak into the retried window.
+        """
         with self._lock:
             if not self.is_run_running(run_id):
                 return False
             self._conn.execute(
                 "DELETE FROM run_records WHERE run_id = ?", (run_id,)
             )
+            self._conn.execute(
+                """
+                UPDATE run_pages SET state = 'abandoned'
+                 WHERE run_id = ? AND state = 'staged'
+                """,
+                (run_id,),
+            )
             return True
 
+    def write_page_file(
+        self,
+        run_id: str,
+        attempt: int,
+        page_no: int,
+        content: bytes,
+        *,
+        response_date: str | None = None,
+        complete_list_size: int | None = None,
+        record_count: int = 0,
+    ) -> dict[str, Any]:
+        """Persist a fetched page's original bytes (slow I/O — call off-loop).
+
+        Only the file is written here; the SQLite index row is inserted by
+        :meth:`stage_records` in the same transaction as the page's records,
+        so the index never points at a page whose records were not staged.
+        """
+        meta = self._raw.write_page(run_id, attempt, page_no, content)
+        return {
+            "run_id": run_id,
+            "attempt": attempt,
+            "page_no": page_no,
+            "file_path": meta["file_path"],
+            "sha256": meta["sha256"],
+            "byte_size": meta["byte_size"],
+            "record_count": record_count,
+            "response_date": response_date,
+            "complete_list_size": complete_list_size,
+        }
+
     def stage_records(
-        self, run_id: str, records: Sequence[dict[str, Any]], seq_start: int
-    ) -> int:
+        self,
+        run_id: str,
+        records: Sequence[dict[str, Any]],
+        seq_start: int = 0,
+        *,
+        page: dict[str, Any] | None = None,
+    ) -> int | None:
         """Insert one page into staging, keeping one row per identifier.
 
         If the same identifier occurs again (whether because of a malformed
         source or a repeated page), the record with the newer OAI datestamp
-        wins; the later observation wins a tie.
+        wins; the later observation wins a tie.  When ``page`` (the metadata
+        returned by :meth:`write_page_file`) is given, the page's index row
+        is inserted in the same transaction and each record remembers its
+        attempt / page / position, which becomes the provenance at commit.
+
+        Returns the number of staged records, or ``None`` when the run is
+        no longer active (cancelled/superseded) and nothing was staged.
         """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if not self.is_run_running(run_id):
                     self._conn.execute("ROLLBACK")
-                    return 0
+                    return None
+                if page is not None:
+                    self._conn.execute(
+                        """
+                        INSERT INTO run_pages
+                            (run_id, attempt, page_no, file_path, sha256,
+                             byte_size, record_count, response_date,
+                             complete_list_size, state, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?)
+                        """,
+                        (
+                            page["run_id"],
+                            page["attempt"],
+                            page["page_no"],
+                            page["file_path"],
+                            page["sha256"],
+                            page["byte_size"],
+                            page["record_count"],
+                            page.get("response_date"),
+                            page.get("complete_list_size"),
+                            utc_now_millis(),
+                        ),
+                    )
                 for offset, record in enumerate(records):
                     seq = seq_start + offset
+                    attempt = page["attempt"] if page else None
+                    page_no = page["page_no"] if page else None
+                    position = (offset + 1) if page else None
                     self._conn.execute(
                         """
                         INSERT INTO run_records
                             (run_id, identifier, title, creator, datestamp,
-                             deleted, seq)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                             deleted, seq, attempt, page_no, position)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(run_id, identifier) DO UPDATE SET
                             title = excluded.title,
                             creator = excluded.creator,
                             datestamp = excluded.datestamp,
                             deleted = excluded.deleted,
-                            seq = excluded.seq
+                            seq = excluded.seq,
+                            attempt = excluded.attempt,
+                            page_no = excluded.page_no,
+                            position = excluded.position
                         WHERE excluded.datestamp > run_records.datestamp
                            OR (excluded.datestamp = run_records.datestamp
                                AND excluded.seq > run_records.seq)
@@ -426,6 +585,9 @@ class Store:
                             record["datestamp"],
                             1 if record.get("deleted") else 0,
                             seq,
+                            attempt,
+                            page_no,
+                            position,
                         ),
                     )
                 self._conn.execute("COMMIT")
@@ -448,6 +610,14 @@ class Store:
         IMMEDIATE transaction as the catalogue writes.  A cancelled or
         superseded round can therefore never publish, even if its HTTP
         response arrives late.
+
+        The same transaction also publishes the round's provenance: the
+        final attempt's raw pages (already durably on disk) are marked
+        ``published``, earlier attempts' pages ``abandoned``, and one
+        ``provenance`` row per adopted record records where its source
+        bytes live.  Catalogue, provenance and watermark therefore always
+        move together — a crash can only expose a complete old or complete
+        new version.
         """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -506,6 +676,47 @@ class Store:
                             ),
                         )
                         upserts += 1
+
+                # Publish the raw pages of the final attempt; pages of
+                # earlier (token-restarted) attempts stay abandoned and are
+                # recycled by the sweeper.
+                final_attempt = int(run["attempt"] or 1)
+                self._conn.execute(
+                    """
+                    UPDATE run_pages SET state = 'published'
+                     WHERE run_id = ? AND attempt = ? AND state = 'staged'
+                    """,
+                    (run_id, final_attempt),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE run_pages SET state = 'abandoned'
+                     WHERE run_id = ? AND attempt <> ? AND state = 'staged'
+                    """,
+                    (run_id, final_attempt),
+                )
+                # One provenance row per adopted record, pointing at the
+                # published page it came from.  The join guarantees the
+                # index only ever references pages that exist in the index
+                # (and whose bytes are already durable on disk).
+                self._conn.execute(
+                    """
+                    INSERT INTO provenance
+                        (identifier, run_id, attempt, page_no, position,
+                         datestamp, deleted, title, creator,
+                         window_from, window_until, published_at)
+                    SELECT rr.identifier, rr.run_id, rr.attempt, rr.page_no,
+                           rr.position, rr.datestamp, rr.deleted, rr.title,
+                           rr.creator, ?, ?, ?
+                      FROM run_records rr
+                      JOIN run_pages rp
+                        ON rp.run_id = rr.run_id
+                       AND rp.attempt = rr.attempt
+                       AND rp.page_no = rr.page_no
+                     WHERE rr.run_id = ? AND rr.attempt IS NOT NULL
+                    """,
+                    (run["window_from"], run["window_until"], now, run_id),
+                )
 
                 watermark = run["window_until"]
                 self._conn.execute(
@@ -634,7 +845,11 @@ class Store:
             rows = self._conn.execute(
                 f"""
                 SELECT identifier, title, creator, source_datestamp,
-                       harvested_at
+                       harvested_at,
+                       EXISTS(
+                           SELECT 1 FROM provenance p
+                            WHERE p.identifier = catalog.identifier
+                       ) AS has_raw
                   FROM catalog {where}
                  ORDER BY title COLLATE NOCASE, identifier
                  LIMIT ? OFFSET ?
@@ -653,3 +868,197 @@ class Store:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # ------------------------------------------------------------ provenance
+    def provenance_for_identifier(self, identifier: str) -> dict[str, Any]:
+        """Every successful round's adopted record for one identifier.
+
+        Each entry locates the adopted record precisely: round, attempt,
+        page number and position within the page, plus the page's SHA-256.
+        """
+        identifier = (identifier or "").strip()
+        with self._lock:
+            catalog_row = self._conn.execute(
+                """
+                SELECT identifier, title, creator, source_datestamp,
+                       harvested_at
+                  FROM catalog WHERE identifier = ?
+                """,
+                (identifier,),
+            ).fetchone()
+            rows = self._conn.execute(
+                """
+                SELECT p.identifier, p.run_id, p.attempt, p.page_no,
+                       p.position, p.datestamp, p.deleted, p.title,
+                       p.creator, p.window_from, p.window_until,
+                       p.published_at,
+                       r.started_at AS run_started_at,
+                       r.finished_at AS run_finished_at,
+                       rp.sha256, rp.byte_size
+                  FROM provenance p
+                  JOIN runs r ON r.id = p.run_id
+                  LEFT JOIN run_pages rp
+                    ON rp.run_id = p.run_id
+                   AND rp.attempt = p.attempt
+                   AND rp.page_no = p.page_no
+                   AND rp.state = 'published'
+                 WHERE p.identifier = ?
+                 ORDER BY p.published_at DESC, r.started_at DESC
+                """,
+                (identifier,),
+            ).fetchall()
+        return {
+            "identifier": identifier,
+            "in_catalog": catalog_row is not None,
+            "catalog": dict(catalog_row) if catalog_row else None,
+            "entries": [dict(r) for r in rows],
+        }
+
+    def recent_withdrawals(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Latest withdrawn records across all published rounds (撤回历史)."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT p.identifier, p.run_id, p.attempt, p.page_no,
+                       p.position, p.datestamp, p.published_at,
+                       p.window_from, p.window_until,
+                       r.started_at AS run_started_at
+                  FROM provenance p
+                  JOIN runs r ON r.id = p.run_id
+                 WHERE p.deleted = 1
+                 ORDER BY p.published_at DESC, r.started_at DESC
+                 LIMIT ?
+                """,
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_published_page(
+        self, run_id: str, attempt: int, page_no: int
+    ) -> dict[str, Any] | None:
+        """Index row of a published page (only published pages are served)."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT rp.*, r.window_from, r.window_until,
+                       r.started_at AS run_started_at
+                  FROM run_pages rp
+                  JOIN runs r ON r.id = rp.run_id
+                 WHERE rp.run_id = ? AND rp.attempt = ? AND rp.page_no = ?
+                   AND rp.state = 'published'
+                """,
+                (run_id, int(attempt), int(page_no)),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def page_adoptions(
+        self, run_id: str, attempt: int, page_no: int
+    ) -> dict[tuple[str, int], int]:
+        """Which records of a page the round finally adopted.
+
+        Maps ``(identifier, position)`` to the deleted flag; records on the
+        page that are absent here were superseded by a later page of the
+        same round (same identifier, newer datestamp / later position).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT identifier, position, deleted
+                  FROM provenance
+                 WHERE run_id = ? AND attempt = ? AND page_no = ?
+                """,
+                (run_id, int(attempt), int(page_no)),
+            ).fetchall()
+            return {
+                (row["identifier"], int(row["position"])): int(row["deleted"])
+                for row in rows
+            }
+
+    def read_page_bytes(self, page: dict[str, Any]) -> bytes:
+        """Read a page's original bytes from the volume (slow I/O)."""
+        return self._raw.read(page["file_path"])
+
+    def page_file_path(self, page: dict[str, Any]) -> Path:
+        return self._raw.abs_path(page["file_path"])
+
+    def page_file_exists(self, page: dict[str, Any]) -> bool:
+        return self._raw.exists(page["file_path"])
+
+    def raw_stats(self) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM run_pages
+                      WHERE state = 'published') AS published_pages,
+                    (SELECT COALESCE(SUM(byte_size), 0) FROM run_pages
+                      WHERE state = 'published') AS published_bytes,
+                    (SELECT COUNT(*) FROM run_pages
+                      WHERE state = 'staged') AS staged_pages,
+                    (SELECT COUNT(*) FROM provenance) AS provenance_entries
+                """
+            ).fetchone()
+            return dict(row)
+
+    # -------------------------------------------------------------- garbage
+    def collect_garbage(self) -> dict[str, Any]:
+        """Recycle raw pages of failed/cancelled rounds and abandoned attempts.
+
+        Idempotent and safe to call at any time: ``running`` rounds and
+        ``published`` pages are never touched, so a late write from a
+        cancelled round lands in that round's own directory and is removed
+        here (or by the next sweep / the next restart), while published
+        history is preserved.
+        """
+        summary: dict[str, Any] = {"removed_rows": 0, "removed_entries": 0}
+        if not self._sweep_lock.acquire(blocking=False):
+            return {**summary, "skipped": True}
+        try:
+            with self._lock:
+                terminal = [
+                    row["id"]
+                    for row in self._conn.execute(
+                        "SELECT id FROM runs WHERE status IN ('failed', 'cancelled')"
+                    )
+                ]
+                running = {
+                    row["id"]
+                    for row in self._conn.execute(
+                        "SELECT id FROM runs WHERE status = 'running'"
+                    )
+                }
+                known = {
+                    row["id"]
+                    for row in self._conn.execute("SELECT id FROM runs")
+                }
+                keep_attempts: dict[str, set[int]] = {}
+                for row in self._conn.execute(
+                    "SELECT run_id, attempt FROM run_pages WHERE state = 'published'"
+                ):
+                    keep_attempts.setdefault(row["run_id"], set()).add(
+                        int(row["attempt"])
+                    )
+                cursor = self._conn.execute(
+                    "DELETE FROM run_pages WHERE state = 'abandoned'"
+                )
+                summary["removed_rows"] += cursor.rowcount
+                cursor = self._conn.execute(
+                    """
+                    DELETE FROM run_pages
+                     WHERE run_id IN (
+                         SELECT id FROM runs
+                          WHERE status IN ('failed', 'cancelled'))
+                    """
+                )
+                summary["removed_rows"] += cursor.rowcount
+            # File removal is slow I/O: it happens outside the database
+            # lock so queries and cancellation stay responsive.
+            summary["removed_entries"] = self._raw.sweep(
+                terminal_runs=terminal,
+                running_runs=running,
+                known_runs=known,
+                keep_attempts=keep_attempts,
+            )
+            return summary
+        finally:
+            self._sweep_lock.release()
